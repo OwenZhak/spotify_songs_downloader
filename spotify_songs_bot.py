@@ -4,8 +4,9 @@ import tempfile
 import logging
 import asyncio
 import nest_asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from dotenv import load_dotenv
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import TimedOut
 
 # Apply nest_asyncio to handle nested event loops in VS Code
@@ -18,36 +19,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Telegram bot token (replace with your actual token)
-TOKEN = ""  # Replace with your bot's API token
+# Suppress httpx and telegram logs by setting their level to WARNING
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('telegram').setLevel(logging.WARNING)
+
+# Load .env file and get token
+load_dotenv()
+TOKEN = os.getenv('TELEGRAM_TOKEN')
+if not TOKEN:
+    logger.error("Failed to read TELEGRAM_TOKEN from .env file")
+    raise ValueError("TELEGRAM_TOKEN not found in .env file")
+logger.info("Successfully read TELEGRAM_TOKEN from .env file")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the /start command with an inline button."""
+    """Handle the /start command with a persistent reply keyboard."""
     logger.info("Received /start command from user %s", update.message.from_user.id)
-    keyboard = [
-        [InlineKeyboardButton("Download a Song", callback_data='download_song')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    keyboard = [[KeyboardButton("Download a Song")]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
     await update.message.reply_text(
-        "Welcome to the Spotify Song Downloader Bot! Click the button to start downloading a song.",
+        "Welcome to the Spotify Song Downloader Bot! Use the 'Download a Song' button below to start downloading a song.",
         reply_markup=reply_markup
     )
-    logger.info("Sent inline keyboard to user %s", update.message.from_user.id)
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle button clicks."""
-    query = update.callback_query
-    await query.answer()
-    logger.info("Button clicked by user %s: %s", query.from_user.id, query.data)
-    if query.data == 'download_song':
-        await query.message.reply_text("Send a Spotify link to a song.")
-        logger.info("Prompted user %s to send a Spotify link", query.from_user.id)
+    logger.info("Sent reply keyboard to user %s", update.message.from_user.id)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages with Spotify URLs."""
-    logger.info("Received message from user %s: %s", update.message.from_user.id, update.message.text)
+    """Handle text messages, including Spotify URLs and button clicks."""
     message = update.message.text
-    if "spotify.com/track/" in message:
+    logger.info("Received message from user %s: %s", update.message.from_user.id, message)
+
+    if message == "Download a Song":
+        logger.info("Download a Song button clicked by user %s", update.message.from_user.id)
+        await update.message.reply_text("Send a Spotify link to a song.")
+        logger.info("Prompted user %s to send a Spotify link", update.message.from_user.id)
+    elif "spotify.com/track/" in message:
         logger.info("Detected Spotify track URL: %s", message)
         await update.message.reply_text("Downloading your song, please wait...")
         track_url = message.strip()
@@ -87,8 +91,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Error downloading the song: {e}")
                 logger.error("Download failed: %s", e)
     else:
-        await update.message.reply_text("Please send a valid Spotify track URL.")
-        logger.info("Invalid URL sent by user %s", update.message.from_user.id)
+        logger.info("Invalid input from user %s: %s", update.message.from_user.id, message)
+        await update.message.reply_text("Please use the 'Download a Song' button or send a valid Spotify track URL.")
 
 async def main():
     logger.info("Starting Spotify Telegram Bot...")
@@ -98,7 +102,6 @@ async def main():
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Handlers added")
     
