@@ -4,110 +4,355 @@ import tempfile
 import logging
 import asyncio
 import nest_asyncio
+import re
+import base64
+import json
+import urllib.request
+import urllib.parse
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+)
 from telegram.error import TimedOut
 
-# Apply nest_asyncio to handle nested event loops in VS Code
 nest_asyncio.apply()
 
-# Configure logging for debug output
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Suppress httpx and telegram logs by setting their level to WARNING
-logging.getLogger('httpx').setLevel(logging.WARNING)
-logging.getLogger('telegram').setLevel(logging.WARNING)
-
-# Load .env file and get token
 load_dotenv()
-TOKEN = os.getenv('TELEGRAM_TOKEN')
-if not TOKEN:
-    logger.error("Failed to read TELEGRAM_TOKEN from .env file")
-    raise ValueError("TELEGRAM_TOKEN not found in .env file")
-logger.info("Successfully read TELEGRAM_TOKEN from .env file")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the /start command with a persistent reply keyboard."""
     logger.info("Received /start command from user %s", update.message.from_user.id)
-    keyboard = [[KeyboardButton("Download a Song")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+    keyboard = [[InlineKeyboardButton("Download a Song", callback_data='download_song')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "Welcome to the Spotify Song Downloader Bot! Use the 'Download a Song' button below to start downloading a song.",
+        "Welcome to the Spotify Song Downloader Bot! Click the button to start downloading a song.",
         reply_markup=reply_markup
     )
-    logger.info("Sent reply keyboard to user %s", update.message.from_user.id)
+    logger.info("Sent inline keyboard to user %s", update.message.from_user.id)
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    logger.info("Button clicked by user %s: %s", query.from_user.id, query.data)
+    if query.data == 'download_song':
+        await query.message.reply_text("Send a Spotify track URL (e.g. https://open.spotify.com/track/...)")
+        logger.info("Prompted user %s to send a Spotify track URL", query.from_user.id)
+
+
+def extract_youtube_url(text: str) -> str | None:
+    """
+    Look for Youtube URL in text (stdout or stderr).
+    Normalize music.youtube.com -> www.youtube.com
+    """
+    if not text:
+        return None
+    # Match youtube.com/watch?v=..., music.youtube.com/watch?v=..., youtu.be/...
+    pattern = r"(https?://(?:www\.|music\.)?youtube\.com/watch\?v=[\w\-\_]+(?:[&][^\s]*)?|https?://youtu\.be/[\w\-\_]+(?:\?[^ \n\r]*)?)"
+    match = re.search(pattern, text)
+    if not match:
+        return None
+    url = match.group(1)
+    # Normalize music.youtube.com to www.youtube.com
+    url = url.replace("music.youtube.com", "www.youtube.com")
+    return url
+
+
+async def run_subprocess(cmd: list[str], env=None, allow_nonzero: bool = False) -> str:
+    """
+    Run subprocess asynchronously.
+
+    If allow_nonzero is True, do NOT raise on non-zero return code: return combined stdout+stderr so caller can inspect.
+    If allow_nonzero is False, raise on non-zero return code (same as before).
+    """
+    logger.info("Running subprocess: %s", cmd)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env
+    )
+    stdout, stderr = await proc.communicate()
+    out = (stdout.decode() if stdout else "") + ("\n" + stderr.decode() if stderr else "")
+    if proc.returncode != 0:
+        if allow_nonzero:
+            logger.debug("Subprocess returned non-zero but allow_nonzero=True, returning combined output.")
+            return out
+        else:
+            err_msg = stderr.decode().strip() or stdout.decode().strip()
+            raise RuntimeError(f"Command {cmd} failed with error: {err_msg}")
+    return out
+
+
+def extract_spotify_track_id(spotify_url: str) -> str | None:
+    """Extract track id from spotify url"""
+    m = re.search(r"track/([A-Za-z0-9]+)", spotify_url)
+    return m.group(1) if m else None
+
+
+def get_spotify_token_blocking(client_id: str, client_secret: str) -> str:
+    """Blocking function to request Spotify client_credentials token."""
+    token_url = "https://accounts.spotify.com/api/token"
+    data = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
+    auth = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    req = urllib.request.Request(token_url, data=data, method="POST")
+    req.add_header("Authorization", f"Basic {auth}")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read()
+    parsed = json.loads(body.decode())
+    return parsed.get("access_token")
+
+
+def get_spotify_track_info_blocking(token: str, track_id: str) -> dict | None:
+    """Blocking GET track info from Spotify API."""
+    url = f"https://api.spotify.com/v1/tracks/{track_id}"
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read()
+    return json.loads(body.decode())
+
+
+async def get_spotify_search_query(spotify_url: str) -> str | None:
+    """
+    Use Spotify Web API (client_credentials) to fetch artist - track to use as a yt-dlp search query.
+    Runs network calls in thread to avoid blocking event loop.
+    """
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        logger.warning("Spotify client id/secret not configured; cannot fetch metadata fallback.")
+        return None
+
+    track_id = extract_spotify_track_id(spotify_url)
+    if not track_id:
+        logger.warning("Could not parse track id from url: %s", spotify_url)
+        return None
+
+    try:
+        token = await asyncio.to_thread(get_spotify_token_blocking, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)
+        if not token:
+            logger.error("Failed to obtain Spotify token")
+            return None
+        info = await asyncio.to_thread(get_spotify_track_info_blocking, token, track_id)
+        if not info:
+            logger.error("Spotify track info empty")
+            return None
+        name = info.get("name")
+        artists = info.get("artists", [])
+        artist_names = ", ".join(a.get("name") for a in artists if a.get("name"))
+        if name and artist_names:
+            query = f"{artist_names} - {name}"
+            logger.info("Built search query from Spotify metadata: %s", query)
+            return query
+        else:
+            logger.warning("Spotify metadata missing name/artist")
+            return None
+    except Exception as e:
+        logger.exception("Error fetching Spotify metadata: %s", e)
+        return None
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages, including Spotify URLs and button clicks."""
-    message = update.message.text
-    logger.info("Received message from user %s: %s", update.message.from_user.id, message)
+    user_id = update.message.from_user.id
+    message = update.message.text.strip()
+    logger.info("Received message from user %s: %s", user_id, message)
 
-    if message == "Download a Song":
-        logger.info("Download a Song button clicked by user %s", update.message.from_user.id)
-        await update.message.reply_text("Send a Spotify link to a song.")
-        logger.info("Prompted user %s to send a Spotify link", update.message.from_user.id)
-    elif "spotify.com/track/" in message:
-        logger.info("Detected Spotify track URL: %s", message)
-        await update.message.reply_text("Downloading your song, please wait...")
-        track_url = message.strip()
-        
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            logger.info("Created temporary directory: %s", tmpdirname)
-            command = ["spotdl", "--output", tmpdirname, track_url]
-            logger.info("Executing command: %s", command)
+    if "spotify.com/track/" not in message:
+        await update.message.reply_text("Please send a valid Spotify track URL.")
+        logger.info("Invalid URL sent by user %s", user_id)
+        return
+
+    await update.message.reply_text("Downloading your song, please wait...")
+    track_url = message
+
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        logger.info("Created temporary directory: %s", tmpdirname)
+
+        env = os.environ.copy()
+        if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
+            env["SPOTIFY_CLIENT_ID"] = SPOTIFY_CLIENT_ID
+            env["SPOTIFY_CLIENT_SECRET"] = SPOTIFY_CLIENT_SECRET
+            logger.info("Using Spotify API credentials from environment")
+        else:
+            logger.warning("Spotify API credentials not set. Rate limiting may occur.")
+
+        # Step 1: Attempt to get YouTube URL from spotdl url (capture stdout+stderr)
+        spotdl_cmd = ["spotdl", "url", track_url]
+        logger.info("Executing spotdl command: %s", spotdl_cmd)
+        try:
+            # allow_nonzero True so we can inspect stderr for URLs even if spotdl failed
+            spotdl_output = await run_subprocess(spotdl_cmd, env=env, allow_nonzero=True)
+            logger.info("spotdl raw output (stdout+stderr):\n%s", spotdl_output)
+            yt_url = extract_youtube_url(spotdl_output)
+
+            if yt_url:
+                logger.info("Extracted YouTube URL from spotdl output: %s", yt_url)
+            else:
+                logger.info("No YouTube URL in spotdl output; trying Spotify metadata + yt-dlp search fallback.")
+        except Exception as e:
+            # run_subprocess shouldn't raise here because allow_nonzero=True, but just in case
+            logger.exception("Error running spotdl url: %s", e)
+            yt_url = None
+
+        # If spotdl didn't give us a URL, fallback to searching YouTube via yt-dlp using Spotify metadata
+        if not (locals().get("yt_url")):
+            yt_url = None  # defensive
+        if not yt_url:
+            search_query = await get_spotify_search_query(track_url)
+            if not search_query:
+                await update.message.reply_text("Failed to resolve the track to a YouTube URL and couldn't fetch Spotify metadata for fallback.")
+                logger.error("No search query could be built for fallback.")
+                return
+
+            # Use yt-dlp search to download the first match
+            yt_search_arg = f"ytsearch1:{search_query}"
+            logger.info("Using yt-dlp search arg: %s", yt_search_arg)
+            ytdlp_cmd = [
+                "yt-dlp",
+                "-f", "mp4",
+                "-o", os.path.join(tmpdirname, "%(title)s.%(ext)s"),
+                yt_search_arg
+            ]
             try:
-                subprocess.run(command, check=True)
-                
-                mp3_file = None
-                for root, dirs, files in os.walk(tmpdirname):
-                    for file in files:
-                        if file.endswith(".mp3"):
-                            mp3_file = os.path.join(root, file)
-                            logger.info("Found MP3 file: %s", mp3_file)
-                            break
-                
-                if mp3_file:
-                    try:
-                        with open(mp3_file, 'rb') as audio_file:
-                            await update.message.reply_audio(audio=audio_file)
-                        await update.message.reply_text("Here's your song! 🎶")
-                        logger.info("Sent MP3 to user %s", update.message.from_user.id)
-                    except TimedOut as e:
-                        await update.message.reply_text("Error: Timed out while sending the song. The file may be too large or the network is slow.")
-                        logger.error("Timed out sending MP3 to user %s: %s", update.message.from_user.id, e)
-                    except Exception as e:
-                        await update.message.reply_text(f"Error sending the song: {e}")
-                        logger.error("Failed to send MP3 to user %s: %s", update.message.from_user.id, e)
-                else:
-                    await update.message.reply_text("No song was downloaded. The link might be invalid.")
-                    logger.warning("No MP3 file found in %s", tmpdirname)
-            
-            except subprocess.CalledProcessError as e:
-                await update.message.reply_text(f"Error downloading the song: {e}")
-                logger.error("Download failed: %s", e)
-    else:
-        logger.info("Invalid input from user %s: %s", update.message.from_user.id, message)
-        await update.message.reply_text("Please use the 'Download a Song' button or send a valid Spotify track URL.")
+                # for download we want to raise on errors
+                await run_subprocess(ytdlp_cmd, env=env, allow_nonzero=False)
+            except Exception as e:
+                await update.message.reply_text(f"yt-dlp search/download fallback failed: {e}")
+                logger.error("yt-dlp search failed: %s", e)
+                return
+
+            # find downloaded file and continue to conversion/send
+            media_file = None
+            for root, _, files in os.walk(tmpdirname):
+                for file in files:
+                    if file.endswith(".mp4") or file.endswith(".mkv") or file.endswith(".m4a") or file.endswith(".webm"):
+                        media_file = os.path.join(root, file)
+                        logger.info("Found media file from ytsearch: %s", media_file)
+                        break
+                if media_file:
+                    break
+
+            if not media_file:
+                await update.message.reply_text("yt-dlp search completed but no media file was found.")
+                logger.error("No media file found in tempdir after yt-dlp search.")
+                return
+
+            # Convert to mp3 and send (same as below)
+            mp3_path = os.path.splitext(media_file)[0] + ".mp3"
+            logger.info("Converting %s to %s", media_file, mp3_path)
+            ffmpeg_cmd = [
+                "ffmpeg", "-y", "-i", media_file,
+                "-vn", "-ab", "192k", "-ar", "44100", "-f", "mp3", mp3_path
+            ]
+            try:
+                await run_subprocess(ffmpeg_cmd, env=env, allow_nonzero=False)
+                logger.info("Conversion complete")
+            except Exception as e:
+                await update.message.reply_text(f"Error converting video to mp3: {e}")
+                logger.error("ffmpeg conversion failed: %s", e)
+                return
+
+            try:
+                with open(mp3_path, "rb") as audio_file:
+                    await update.message.reply_audio(audio=audio_file)
+                await update.message.reply_text("Here's your song! 🎶")
+                logger.info("Sent audio file to user %s", user_id)
+            except TimedOut as e:
+                await update.message.reply_text(
+                    "Error: Timed out while sending the song. The file may be too large or the network is slow."
+                )
+                logger.error("Timed out sending audio to user %s: %s", user_id, e)
+            except Exception as e:
+                await update.message.reply_text(f"Error sending the song: {e}")
+                logger.error("Failed to send audio to user %s: %s", user_id, e)
+            return
+
+        # If we have a yt_url from spotdl, proceed to download it with yt-dlp (normalized already)
+        yt_url = yt_url  # already normalized by extract_youtube_url
+        yt_output_template = os.path.join(tmpdirname, "%(title)s.%(ext)s")
+        ytdlp_cmd = [
+            "yt-dlp",
+            "-f", "mp4",
+            "-o", yt_output_template,
+            yt_url
+        ]
+        logger.info("Executing yt-dlp command: %s", ytdlp_cmd)
+        try:
+            await run_subprocess(ytdlp_cmd, env=env, allow_nonzero=False)
+        except Exception as e:
+            await update.message.reply_text(f"yt-dlp failed: {e}")
+            logger.error("yt-dlp failed: %s", e)
+            return
+
+        # Step 3: Find downloaded media file (.mp4 or .mkv)
+        media_file = None
+        for root, _, files in os.walk(tmpdirname):
+            for file in files:
+                if file.endswith(".mp4") or file.endswith(".mkv") or file.endswith(".webm") or file.endswith(".m4a"):
+                    media_file = os.path.join(root, file)
+                    logger.info("Found media file: %s", media_file)
+                    break
+            if media_file:
+                break
+
+        if not media_file:
+            await update.message.reply_text("No video file was downloaded.")
+            logger.warning("No media file found in %s", tmpdirname)
+            return
+
+        # Step 4: Convert video to mp3
+        mp3_path = os.path.splitext(media_file)[0] + ".mp3"
+        logger.info("Converting %s to %s", media_file, mp3_path)
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-i", media_file,
+            "-vn", "-ab", "192k", "-ar", "44100", "-f", "mp3", mp3_path
+        ]
+        try:
+            await run_subprocess(ffmpeg_cmd, env=env, allow_nonzero=False)
+            logger.info("Conversion complete")
+        except Exception as e:
+            await update.message.reply_text(f"Error converting video to mp3: {e}")
+            logger.error("ffmpeg conversion failed: %s", e)
+            return
+
+        # Step 5: Send MP3 to user
+        try:
+            with open(mp3_path, "rb") as audio_file:
+                await update.message.reply_audio(audio=audio_file)
+            await update.message.reply_text("Here's your song! 🎶")
+            logger.info("Sent audio file to user %s", user_id)
+        except TimedOut as e:
+            await update.message.reply_text(
+                "Error: Timed out while sending the song. The file may be too large or the network is slow."
+            )
+            logger.error("Timed out sending audio to user %s: %s", user_id, e)
+        except Exception as e:
+            await update.message.reply_text(f"Error sending the song: {e}")
+            logger.error("Failed to send audio to user %s: %s", user_id, e)
+
 
 async def main():
     logger.info("Starting Spotify Telegram Bot...")
-    # Increase HTTP timeout to 60 seconds
     application = Application.builder().token(TOKEN).read_timeout(60).write_timeout(60).build()
-    logger.info("Bot application initialized")
-    
-    # Add handlers
+
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Handlers added")
-    
-    # Start polling with a 1-second interval
-    logger.info("Starting polling...")
+
+    logger.info("Handlers added. Starting polling...")
     await application.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=1.0)
+
 
 if __name__ == "__main__":
     logger.info("Script execution started")
