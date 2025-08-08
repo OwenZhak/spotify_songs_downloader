@@ -163,6 +163,39 @@ async def get_spotify_search_query(spotify_url: str) -> str | None:
         return None
 
 
+async def get_spotify_metadata(spotify_url: str) -> tuple[str | None, str | None]:
+    """
+    Return (title, artist_string) or (None, None) if not available.
+    Uses Spotify Web API client credentials. Runs blocking network calls in thread.
+    """
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        logger.warning("Spotify client id/secret not configured; skipping metadata fetch")
+        return None, None
+
+    track_id = extract_spotify_track_id(spotify_url)
+    if not track_id:
+        logger.warning("Could not parse track id from url for metadata: %s", spotify_url)
+        return None, None
+
+    try:
+        token = await asyncio.to_thread(get_spotify_token_blocking, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)
+        if not token:
+            logger.error("Failed to obtain Spotify token for metadata")
+            return None, None
+        info = await asyncio.to_thread(get_spotify_track_info_blocking, token, track_id)
+        if not info:
+            logger.error("Spotify track info empty for metadata")
+            return None, None
+        title = info.get("name")
+        artists = info.get("artists", [])
+        artist_names = ", ".join(a.get("name") for a in artists if a.get("name"))
+        logger.info("Spotify metadata fetched: title=%s artist=%s", title, artist_names)
+        return title, artist_names
+    except Exception as e:
+        logger.exception("Error fetching Spotify metadata for metadata: %s", e)
+        return None, None
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     message = update.message.text.strip()
@@ -175,6 +208,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Downloading your song, please wait...")
     track_url = message
+
+    # Fetch Spotify metadata early so we can use artist/title in tags and telegram fields
+    title_meta, artist_meta = await get_spotify_metadata(track_url)
+    logger.info("Metadata for track will be used: title=%s artist=%s", title_meta, artist_meta)
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         logger.info("Created temporary directory: %s", tmpdirname)
@@ -206,8 +243,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             yt_url = None
 
         # If spotdl didn't give us a URL, fallback to searching YouTube via yt-dlp using Spotify metadata
-        if not (locals().get("yt_url")):
-            yt_url = None  # defensive
         if not yt_url:
             search_query = await get_spotify_search_query(track_url)
             if not search_query:
@@ -248,13 +283,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error("No media file found in tempdir after yt-dlp search.")
                 return
 
-            # Convert to mp3 and send (same as below)
+            # Convert to mp3 with metadata
             mp3_path = os.path.splitext(media_file)[0] + ".mp3"
-            logger.info("Converting %s to %s", media_file, mp3_path)
+            logger.info("Converting %s to %s (embedding metadata)", media_file, mp3_path)
             ffmpeg_cmd = [
                 "ffmpeg", "-y", "-i", media_file,
-                "-vn", "-ab", "192k", "-ar", "44100", "-f", "mp3", mp3_path
+                "-vn", "-ab", "192k", "-ar", "44100"
             ]
+            if title_meta:
+                ffmpeg_cmd += ["-metadata", f"title={title_meta}"]
+            if artist_meta:
+                ffmpeg_cmd += ["-metadata", f"artist={artist_meta}"]
+            ffmpeg_cmd += ["-f", "mp3", mp3_path]
+
             try:
                 await run_subprocess(ffmpeg_cmd, env=env, allow_nonzero=False)
                 logger.info("Conversion complete")
@@ -263,9 +304,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error("ffmpeg conversion failed: %s", e)
                 return
 
+            # Send mp3 with Telegram metadata (performer/title)
+            send_title = title_meta or os.path.splitext(os.path.basename(mp3_path))[0]
+            send_artist = artist_meta or None
             try:
                 with open(mp3_path, "rb") as audio_file:
-                    await update.message.reply_audio(audio=audio_file)
+                    await update.message.reply_audio(audio=audio_file, title=send_title, performer=send_artist)
                 await update.message.reply_text("Here's your song! 🎶")
                 logger.info("Sent audio file to user %s", user_id)
             except TimedOut as e:
@@ -279,7 +323,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # If we have a yt_url from spotdl, proceed to download it with yt-dlp (normalized already)
-        yt_url = yt_url  # already normalized by extract_youtube_url
         yt_output_template = os.path.join(tmpdirname, "%(title)s.%(ext)s")
         ytdlp_cmd = [
             "yt-dlp",
@@ -295,7 +338,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error("yt-dlp failed: %s", e)
             return
 
-        # Step 3: Find downloaded media file (.mp4 or .mkv)
+        # Step 3: Find downloaded media file (.mp4 or .mkv or .m4a)
         media_file = None
         for root, _, files in os.walk(tmpdirname):
             for file in files:
@@ -311,13 +354,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning("No media file found in %s", tmpdirname)
             return
 
-        # Step 4: Convert video to mp3
+        # Step 4: Convert video to mp3 embedding metadata (title/artist)
         mp3_path = os.path.splitext(media_file)[0] + ".mp3"
-        logger.info("Converting %s to %s", media_file, mp3_path)
+        logger.info("Converting %s to %s (embedding metadata)", media_file, mp3_path)
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", media_file,
-            "-vn", "-ab", "192k", "-ar", "44100", "-f", "mp3", mp3_path
+            "-vn", "-ab", "192k", "-ar", "44100"
         ]
+        if title_meta:
+            ffmpeg_cmd += ["-metadata", f"title={title_meta}"]
+        if artist_meta:
+            ffmpeg_cmd += ["-metadata", f"artist={artist_meta}"]
+        ffmpeg_cmd += ["-f", "mp3", mp3_path]
+
         try:
             await run_subprocess(ffmpeg_cmd, env=env, allow_nonzero=False)
             logger.info("Conversion complete")
@@ -326,10 +375,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error("ffmpeg conversion failed: %s", e)
             return
 
-        # Step 5: Send MP3 to user
+        # Step 5: Send MP3 to user with performer/title fields
+        send_title = title_meta or os.path.splitext(os.path.basename(mp3_path))[0]
+        send_artist = artist_meta or None
         try:
             with open(mp3_path, "rb") as audio_file:
-                await update.message.reply_audio(audio=audio_file)
+                await update.message.reply_audio(audio=audio_file, title=send_title, performer=send_artist)
             await update.message.reply_text("Here's your song! 🎶")
             logger.info("Sent audio file to user %s", user_id)
         except TimedOut as e:
